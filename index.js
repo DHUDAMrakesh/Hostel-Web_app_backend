@@ -5,6 +5,8 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
 const fs = require('fs');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 
 // dotenv.config();
 console.log('Config skipped (manual override)');
@@ -18,6 +20,10 @@ process.env.JWT_EXPIRES_IN = '7d';
 process.env.EMAIL_USER = 'dhudamrakesh0@gmail.com';
 process.env.EMAIL_PASS = 'bycnejhbblrecwjr';
 process.env.MONGO_URI = 'mongodb://localhost:27017/hostel_db';
+// Twilio WhatsApp — set these in .env for production
+if (!process.env.TWILIO_ACCOUNT_SID) process.env.TWILIO_ACCOUNT_SID = '';
+if (!process.env.TWILIO_AUTH_TOKEN) process.env.TWILIO_AUTH_TOKEN = '';
+if (!process.env.TWILIO_WHATSAPP_FROM) process.env.TWILIO_WHATSAPP_FROM = 'whatsapp:+14155238886';
 
 
 // Ensure uploads directory exists
@@ -25,16 +31,29 @@ const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
 
 // Middleware
+app.use(compression()); // gzip all responses
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
-// Request logging
+// Rate limiting — 200 req / 15 min per IP
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: 'Too many requests, please slow down.' },
+});
+app.use('/api', limiter);
+
+// Non-blocking request logging
+const logStream = fs.createWriteStream(path.join(__dirname, 'requests.log'), { flags: 'a' });
 app.use((req, res, next) => {
     const log = `${new Date().toISOString()} - ${req.method} ${req.url}\n`;
-    console.log(log.trim());
-    fs.appendFileSync(path.join(__dirname, 'requests.log'), log);
+    process.stdout.write(log);
+    logStream.write(log);  // async, non-blocking
     next();
 });
+
 
 // Serve uploaded images
 app.use('/uploads', express.static(uploadsDir));
@@ -42,17 +61,24 @@ app.use('/uploads', express.static(uploadsDir));
 // Connect to MongoDB
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/hostel_db';
 mongoose.connect(MONGO_URI)
-    .then(() => console.log(`MongoDB Connected → ${MONGO_URI}`))
+    .then(() => {
+        console.log(`MongoDB Connected → ${MONGO_URI}`);
+        // Start the WhatsApp reminder scheduler after DB is ready
+        const { startScheduler } = require('./utils/scheduler');
+        startScheduler();
+    })
     .catch(err => console.log('MongoDB connection error:', err));
 
 // Import Routes
 const apiRoutes = require('./routes/api');
 const authRoutes = require('./routes/auth');
 const studentRoutes = require('./routes/student');
+const notificationRoutes = require('./routes/notifications');
 
 // Auth routes FIRST (more specific), then student, then general API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/student', studentRoutes);
+app.use('/api/notifications', notificationRoutes);
 app.use('/api', apiRoutes);
 
 app.get('/', (req, res) => {

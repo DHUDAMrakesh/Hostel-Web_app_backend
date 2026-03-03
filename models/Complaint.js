@@ -18,4 +18,9 @@ const ComplaintSchema = new mongoose.Schema({
     },
 }, { timestamps: true });
 
+// Indexes for fast lookups
+ComplaintSchema.index({ userId: 1, createdAt: -1 });
+ComplaintSchema.index({ status: 1 });
+
 module.exports = mongoose.model('Complaint', ComplaintSchema);
+

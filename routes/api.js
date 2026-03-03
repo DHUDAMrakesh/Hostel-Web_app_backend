@@ -6,6 +6,7 @@ const Bed = require('../models/Bed');
 const Student = require('../models/Student');
 const FoodMenu = require('../models/FoodMenu');
 const Facility = require('../models/Facility');
+const Complaint = require('../models/Complaint');
 const { verifyToken, requireRole } = require('../middleware/auth');
 
 // ─── Multer setup ───
@@ -21,16 +22,168 @@ const upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
 // ─── Stats (all authenticated roles) ───
 router.get('/stats', verifyToken, async (req, res) => {
     try {
-        const totalBeds = await Bed.countDocuments();
-        const occupiedBeds = await Bed.countDocuments({ isOccupied: true });
-        const availableBeds = totalBeds - occupiedBeds;
-        const students = await Student.find();
-        const feeDues = students.reduce((acc, s) => acc + s.feeDues, 0);
-        res.json({ totalBeds, occupiedBeds, availableBeds, feeDues });
+        const [totalBeds, occupiedBeds, feeAgg] = await Promise.all([
+            Bed.countDocuments(),
+            Bed.countDocuments({ isOccupied: true }),
+            Student.aggregate([{ $group: { _id: null, total: { $sum: '$feeDues' } } }]),
+        ]);
+        res.json({
+            totalBeds,
+            occupiedBeds,
+            availableBeds: totalBeds - occupiedBeds,
+            feeDues: feeAgg[0]?.total || 0,
+        });
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
 });
+
+
+// ─── Room Management (admin + manager) ───
+
+// GET /api/rooms — list all rooms with occupant info
+router.get('/rooms', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const beds = await Bed.find().sort({ roomNumber: 1, bedNumber: 1 });
+        const students = await Student.find({ roomNumber: { $ne: '' } }).select('name email phone roomNumber feeDues');
+
+        // Group beds by roomNumber
+        const roomMap = {};
+        for (const bed of beds) {
+            if (!roomMap[bed.roomNumber]) {
+                roomMap[bed.roomNumber] = {
+                    roomNumber: bed.roomNumber,
+                    type: bed.type,
+                    beds: [],
+                    occupants: [],
+                };
+            }
+            roomMap[bed.roomNumber].beds.push(bed);
+        }
+
+        // Attach occupants
+        for (const s of students) {
+            if (roomMap[s.roomNumber]) {
+                roomMap[s.roomNumber].occupants.push(s);
+            }
+        }
+
+        const rooms = Object.values(roomMap).map(r => ({
+            ...r,
+            totalBeds: r.beds.length,
+            occupiedBeds: r.beds.filter(b => b.isOccupied).length,
+            available: r.beds.some(b => !b.isOccupied),
+        }));
+
+        res.json(rooms);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// POST /api/rooms — create a new room (adds beds for it)
+router.post('/rooms', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { roomNumber, type, capacity } = req.body;
+        if (!roomNumber || !capacity) return res.status(400).json({ message: 'roomNumber and capacity are required.' });
+
+        const existing = await Bed.findOne({ roomNumber });
+        if (existing) return res.status(409).json({ message: `Room ${roomNumber} already exists.` });
+
+        const bedDocs = [];
+        for (let i = 1; i <= Number(capacity); i++) {
+            bedDocs.push({ roomNumber, bedNumber: `B${i}`, type: type || 'Classic', isOccupied: false });
+        }
+        const created = await Bed.insertMany(bedDocs);
+        res.status(201).json({ message: `Room ${roomNumber} created with ${capacity} bed(s).`, beds: created });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// PUT /api/rooms/:roomNumber — update room type
+router.put('/rooms/:roomNumber', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { type } = req.body;
+        if (!type) return res.status(400).json({ message: 'type is required.' });
+        await Bed.updateMany({ roomNumber: req.params.roomNumber }, { type });
+        res.json({ message: `Room ${req.params.roomNumber} updated.` });
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// DELETE /api/rooms/:roomNumber — delete a room and all its beds
+router.delete('/rooms/:roomNumber', verifyToken, requireRole('admin'), async (req, res) => {
+    try {
+        const occupied = await Bed.findOne({ roomNumber: req.params.roomNumber, isOccupied: true });
+        if (occupied) return res.status(409).json({ message: 'Cannot delete an occupied room. Unassign students first.' });
+
+        await Bed.deleteMany({ roomNumber: req.params.roomNumber });
+        res.json({ message: `Room ${req.params.roomNumber} and all its beds deleted.` });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// POST /api/rooms/:roomNumber/assign — assign a student to this room
+router.post('/rooms/:roomNumber/assign', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { studentId } = req.body;
+        if (!studentId) return res.status(400).json({ message: 'studentId is required.' });
+
+        const student = await Student.findById(studentId);
+        if (!student) return res.status(404).json({ message: 'Student not found.' });
+
+        // Find a free bed in this room
+        const freeBed = await Bed.findOne({ roomNumber: req.params.roomNumber, isOccupied: false });
+        if (!freeBed) return res.status(409).json({ message: 'No available beds in this room.' });
+
+        // Mark old bed free if student was in another room
+        if (student.roomNumber && student.roomNumber !== req.params.roomNumber) {
+            await Bed.findOneAndUpdate(
+                { roomNumber: student.roomNumber, isOccupied: true },
+                { isOccupied: false }
+            );
+        }
+
+        freeBed.isOccupied = true;
+        await freeBed.save();
+
+        student.roomNumber = req.params.roomNumber;
+        await student.save();
+
+        res.json({ message: `${student.name} assigned to Room ${req.params.roomNumber}.`, student });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// POST /api/rooms/:roomNumber/unassign — remove a student from this room
+router.post('/rooms/:roomNumber/unassign', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { studentId } = req.body;
+        if (!studentId) return res.status(400).json({ message: 'studentId is required.' });
+
+        const student = await Student.findById(studentId);
+        if (!student) return res.status(404).json({ message: 'Student not found.' });
+
+        // Free a bed in this room
+        await Bed.findOneAndUpdate(
+            { roomNumber: req.params.roomNumber, isOccupied: true },
+            { isOccupied: false }
+        );
+
+        student.roomNumber = '';
+        await student.save();
+
+        res.json({ message: `${student.name} removed from Room ${req.params.roomNumber}.` });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+
 
 // ─── Food Menu ───
 
@@ -195,10 +348,10 @@ router.post('/students', verifyToken, requireRole('admin', 'manager'), async (re
 // PUT update student — admin + manager
 router.put('/students/:id', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
     try {
-        const { name, roomNumber, email, phone, feeDues, monthlyFee } = req.body;
+        const { name, roomNumber, email, phone, feeDues, monthlyFee, guardianName, emergencyContact } = req.body;
         const updated = await Student.findByIdAndUpdate(
             req.params.id,
-            { name, roomNumber, email, phone, feeDues, monthlyFee },
+            { name, roomNumber, email, phone, feeDues, monthlyFee, guardianName, emergencyContact },
             { new: true, runValidators: true }
         );
         if (!updated) return res.status(404).json({ message: 'Student not found' });
@@ -213,7 +366,17 @@ router.delete('/students/:id', verifyToken, requireRole('admin'), async (req, re
     try {
         const deleted = await Student.findByIdAndDelete(req.params.id);
         if (!deleted) return res.status(404).json({ message: 'Student not found' });
-        res.json({ message: 'Deleted' });
+
+        // Also remove the linked User login account so they can no longer sign in
+        const User = require('../models/User');
+        if (deleted.userId) {
+            await User.findByIdAndDelete(deleted.userId);
+        } else if (deleted.email) {
+            // Fallback: match by email if userId link is missing
+            await User.deleteOne({ email: deleted.email, role: 'student' });
+        }
+
+        res.json({ message: 'Student and login account deleted successfully.' });
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
@@ -246,6 +409,33 @@ router.delete('/students/:id/payments/:pid', verifyToken, requireRole('admin', '
         student.payments = student.payments.filter(p => p._id.toString() !== req.params.pid);
         const saved = await student.save();
         res.json(saved);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// ─── Complaints (Admin/Manager) ───
+
+// GET all complaints
+router.get('/complaints', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const complaints = await Complaint.find().sort({ createdAt: -1 });
+        res.json(complaints);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// PATCH update complaint status
+router.patch('/complaints/:id/status', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { status } = req.body;
+        if (!['pending', 'in-review', 'resolved'].includes(status)) {
+            return res.status(400).json({ message: 'Invalid status' });
+        }
+        const updated = await Complaint.findByIdAndUpdate(req.params.id, { status }, { new: true });
+        if (!updated) return res.status(404).json({ message: 'Complaint not found' });
+        res.json(updated);
     } catch (err) {
         res.status(500).json({ message: err.message });
     }

@@ -3,6 +3,7 @@ const router = express.Router();
 const Student = require('../models/Student');
 const Complaint = require('../models/Complaint');
 const User = require('../models/User');
+const Notification = require('../models/Notification');
 const { verifyToken, requireRole } = require('../middleware/auth');
 
 // All routes here: verifyToken + student role only
@@ -20,76 +21,110 @@ router.get('/me', async (req, res) => {
 });
 
 // ─── GET /api/student/rooms/available ─────────────────────────────────────
-// Returns rooms not yet fully occupied
-// We generate rooms 101–340 (floors 1-3, 40 rooms/floor, capacity 2 each)
-// and mark ones already occupied.
+// Returns rooms from the actual Bed collection (managed by admin)
 router.get('/rooms/available', async (req, res) => {
     try {
-        // Get all occupied room numbers
-        const occupied = await Student.distinct('roomNumber', { roomNumber: { $ne: '' } });
-        const occupiedSet = new Set(occupied);
+        const Bed = require('../models/Bed');
 
-        // Generate a fixed set of rooms
-        const rooms = [];
-        const floors = [1, 2, 3];
-        for (const floor of floors) {
-            for (let room = 1; room <= 10; room++) {
-                const num = `${floor}0${room <= 9 ? '0' + room : room}`;
-                const isOccupied = occupiedSet.has(num);
-                rooms.push({
-                    number: num,
-                    floor,
-                    type: room <= 4 ? 'Single' : room <= 8 ? 'Double' : 'Triple',
-                    capacity: room <= 4 ? 1 : room <= 8 ? 2 : 3,
-                    available: !isOccupied,
-                });
+        // Get all beds from the DB
+        const beds = await Bed.find().sort({ roomNumber: 1, bedNumber: 1 });
+
+        // Group by roomNumber
+        const roomMap = {};
+        for (const bed of beds) {
+            if (!roomMap[bed.roomNumber]) {
+                roomMap[bed.roomNumber] = {
+                    number: bed.roomNumber,
+                    type: bed.type,        // Classic | Premium
+                    beds: [],
+                };
             }
+            roomMap[bed.roomNumber].beds.push(bed);
         }
+
+        // Derive floor from first digit(s), capacity, availability
+        const rooms = Object.values(roomMap).map(r => {
+            const totalBeds = r.beds.length;
+            const occupiedBeds = r.beds.filter(b => b.isOccupied).length;
+            const available = occupiedBeds < totalBeds;
+
+            // Infer floor from leading digit(s) of roomNumber, fallback to 1
+            const floorMatch = r.number.match(/^(\d+)/);
+            const floor = floorMatch ? Math.floor(Number(floorMatch[1]) / 100) || 1 : 1;
+
+            // Map Classic/Premium → Single/Double/Triple for display compat
+            const typeLabel = totalBeds === 1 ? 'Single' : totalBeds === 2 ? 'Double' : totalBeds <= 4 ? 'Triple' : 'Dormitory';
+
+            return {
+                number: r.number,
+                floor,
+                type: typeLabel,
+                roomType: r.type,   // Classic | Premium
+                capacity: totalBeds,
+                occupiedBeds,
+                available,
+            };
+        });
+
         res.json(rooms);
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
 });
 
+
 // ─── POST /api/student/book ────────────────────────────────────────────────
-// Book a room for the logged-in student. Creates or updates Student record.
+// Book a room for the logged-in student. Syncs Bed occupancy with admin rooms.
 router.post('/book', async (req, res) => {
     try {
-        const { roomNumber, phone } = req.body;
+        const Bed = require('../models/Bed');
+        const { roomNumber, phone, guardianName, emergencyContact } = req.body;
         if (!roomNumber) return res.status(400).json({ message: 'Room number is required.' });
 
-        // Check if room is already taken
-        const taken = await Student.findOne({ roomNumber, userId: { $ne: req.user.id } });
-        if (taken) return res.status(409).json({ message: 'This room is already occupied. Please choose another.' });
+        // Verify the room exists in the Bed collection and has a free bed
+        const freeBed = await Bed.findOne({ roomNumber, isOccupied: false });
+        if (!freeBed) return res.status(409).json({ message: 'No available beds in this room. Please choose another.' });
 
-        // Check if this user already has a profile
         let student = await Student.findOne({ userId: req.user.id });
-
         const user = await User.findById(req.user.id);
 
         if (student) {
-            // Update room
+            // If changing rooms — free the old bed
+            if (student.roomNumber && student.roomNumber !== roomNumber) {
+                await Bed.findOneAndUpdate(
+                    { roomNumber: student.roomNumber, isOccupied: true },
+                    { isOccupied: false }
+                );
+            }
             student.roomNumber = roomNumber;
             if (phone) student.phone = phone;
+            if (guardianName) student.guardianName = guardianName;
+            if (emergencyContact) student.emergencyContact = emergencyContact;
             await student.save();
         } else {
-            // Create profile linked to user
             student = await Student.create({
                 userId: req.user.id,
                 name: user.name,
                 email: user.email,
                 phone: phone || '',
+                guardianName: guardianName || '',
+                emergencyContact: emergencyContact || '',
                 roomNumber,
-                feeDues: 5000, // first month due on booking
+                feeDues: 5000,
                 monthlyFee: 5000,
             });
         }
+
+        // Mark a bed in the new room as occupied
+        freeBed.isOccupied = true;
+        await freeBed.save();
 
         res.json(student);
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
 });
+
 
 // ─── POST /api/student/pay ─────────────────────────────────────────────────
 // Record a fee payment for the logged-in student
@@ -140,6 +175,19 @@ router.post('/complaints', async (req, res) => {
             description,
             category: category || 'other',
         });
+        console.log(`[Complaint] Created: ${complaint._id} by ${user.name}`);
+
+        const admins = await User.find({ role: { $in: ['admin', 'manager'] } });
+        console.log(`[Complaint] Notifying ${admins.length} admins`);
+        for (const admin of admins) {
+            await Notification.create({
+                userId: admin._id,
+                type: 'complaint',
+                title: 'New Complaint Raised',
+                message: `${user.name} raised a complaint: "${title}"`,
+                link: '/admin/complaints'
+            });
+        }
 
         res.status(201).json(complaint);
     } catch (err) {
