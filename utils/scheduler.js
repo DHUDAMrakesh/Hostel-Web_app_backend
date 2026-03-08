@@ -13,6 +13,7 @@
 const cron = require('node-cron');
 const Student = require('../models/Student');
 const Notification = require('../models/Notification');
+const Invoice = require('../models/Invoice');
 const { sendWhatsAppReminder } = require('./whatsapp');
 
 const CYCLE_DAYS = 30;
@@ -118,7 +119,42 @@ async function runReminderJob() {
 
         if (!isReminderDay) continue;
 
-        console.log(`[Scheduler] → Billing day for "${student.name}" (cycle #${cycleNumber})`);
+        // ── Idempotency Check ────────────────────────────────────────────────
+        // Check if we already generated an automated invoice for this student + cycle
+        const existingInvoice = await Invoice.findOne({
+            studentId: student._id,
+            note: `Automated Billing — Cycle #${cycleNumber}`
+        });
+
+        if (existingInvoice) {
+            console.log(`[Scheduler] ℹ Cycle #${cycleNumber} already billed for "${student.name}". Skipping automated generation.`);
+        } else {
+            console.log(`[Scheduler] ⚡ Generating automated bill for "${student.name}" (cycle #${cycleNumber})`);
+
+            // 1. Create the Invoice
+            const dueDate = new Date();
+            dueDate.setDate(dueDate.getDate() + 5); // Due in 5 days
+
+            const newInvoice = await Invoice.create({
+                studentId: student._id,
+                totalAmount: student.monthlyFee,
+                feePlans: [{
+                    name: `Monthly Hostel Fee (Cycle #${cycleNumber})`,
+                    amount: student.monthlyFee
+                }],
+                status: 'Issued',
+                dueDate: dueDate,
+                note: `Automated Billing — Cycle #${cycleNumber}`
+            });
+
+            // 2. Increment Student Dues
+            await Student.findByIdAndUpdate(student._id, {
+                $inc: { feeDues: student.monthlyFee }
+            });
+
+            // Update local student object for the notification below
+            student.feeDues += student.monthlyFee;
+        }
 
         const result = {
             studentId: student._id,
@@ -127,14 +163,14 @@ async function runReminderJob() {
             channels: [],
         };
 
-        // ── 1. In-app notification (always) ──
+        // ── Notifications ────────────────────────────────────────────────────
         try {
             if (student.userId) {
                 await Notification.create({
                     userId: student.userId,
                     type: 'payment',
                     title: '💰 Monthly Fee Due',
-                    message: `Your 30-day billing cycle #${cycleNumber} ends today. Monthly fee: ₹${student.monthlyFee}. Outstanding dues: ₹${student.feeDues}.`,
+                    message: `Your 30-day billing cycle #${cycleNumber} ends today. Bill Generated: ₹${student.monthlyFee}. Total outstanding: ₹${student.feeDues}.`,
                     link: '/student/fees',
                 });
                 result.channels.push('in-app');
@@ -143,7 +179,6 @@ async function runReminderJob() {
             console.error(`[Scheduler] In-app notification error for ${student.name}:`, err.message);
         }
 
-        // ── 2. WhatsApp (if phone available) ──
         if (student.phone) {
             try {
                 await sendWhatsAppReminder(
@@ -160,7 +195,6 @@ async function runReminderJob() {
             }
         }
 
-        // ── 3. Email (if email available — always runs as fallback) ──
         if (student.email) {
             const emailResult = await sendFeeReminderEmail(
                 student.email,

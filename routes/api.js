@@ -73,6 +73,7 @@ router.get('/rooms', verifyToken, requireRole('admin', 'manager'), async (req, r
             totalBeds: r.beds.length,
             occupiedBeds: r.beds.filter(b => b.isOccupied).length,
             available: r.beds.some(b => !b.isOccupied),
+            status: r.beds[0]?.status || 'available',   // maintenance status from first bed
         }));
 
         res.json(rooms);
@@ -121,6 +122,20 @@ router.delete('/rooms/:roomNumber', verifyToken, requireRole('admin'), async (re
 
         await Bed.deleteMany({ roomNumber: req.params.roomNumber });
         res.json({ message: `Room ${req.params.roomNumber} and all its beds deleted.` });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// PATCH /api/rooms/:roomNumber/status — toggle maintenance (admin + manager)
+router.patch('/rooms/:roomNumber/status', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { status } = req.body;
+        if (!['available', 'maintenance'].includes(status)) {
+            return res.status(400).json({ message: 'status must be "available" or "maintenance".' });
+        }
+        await Bed.updateMany({ roomNumber: req.params.roomNumber }, { status });
+        res.json({ message: `Room ${req.params.roomNumber} marked as ${status}.` });
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
@@ -178,6 +193,51 @@ router.post('/rooms/:roomNumber/unassign', verifyToken, requireRole('admin', 'ma
         await student.save();
 
         res.json({ message: `${student.name} removed from Room ${req.params.roomNumber}.` });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// POST /api/rooms/:roomNumber/transfer — move a student from their current room to this room
+router.post('/rooms/:roomNumber/transfer', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+    try {
+        const { studentId } = req.body;
+        if (!studentId) return res.status(400).json({ message: 'studentId is required.' });
+
+        const student = await Student.findById(studentId);
+        if (!student) return res.status(404).json({ message: 'Student not found.' });
+
+        const targetRoom = req.params.roomNumber;
+        if (student.roomNumber === targetRoom) {
+            return res.status(400).json({ message: 'Student is already in this room.' });
+        }
+
+        // Check if target room is under maintenance
+        const maintenanceBed = await Bed.findOne({ roomNumber: targetRoom, status: 'maintenance' });
+        if (maintenanceBed) {
+            return res.status(409).json({ message: `Room ${targetRoom} is under maintenance.` });
+        }
+
+        // Find a free bed in the target room
+        const freeBed = await Bed.findOne({ roomNumber: targetRoom, isOccupied: false });
+        if (!freeBed) return res.status(409).json({ message: `No available beds in Room ${targetRoom}.` });
+
+        // Free the old bed
+        if (student.roomNumber) {
+            await Bed.findOneAndUpdate(
+                { roomNumber: student.roomNumber, isOccupied: true },
+                { isOccupied: false }
+            );
+        }
+
+        // Occupy new bed
+        freeBed.isOccupied = true;
+        await freeBed.save();
+
+        student.roomNumber = targetRoom;
+        await student.save();
+
+        res.json({ message: `${student.name} transferred to Room ${targetRoom}.`, student });
     } catch (err) {
         res.status(500).json({ message: err.message });
     }
@@ -296,8 +356,8 @@ router.get('/students', verifyToken, requireRole('admin', 'manager'), async (req
     }
 });
 
-// POST create student — admin + manager
-router.post('/students', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+// POST create student — admin only
+router.post('/students', verifyToken, requireRole('admin'), async (req, res) => {
     try {
         const { name, email, phone } = req.body;
         if (!name || !email) {
@@ -345,8 +405,8 @@ router.post('/students', verifyToken, requireRole('admin', 'manager'), async (re
     }
 });
 
-// PUT update student — admin + manager
-router.put('/students/:id', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+// PUT update student — admin only
+router.put('/students/:id', verifyToken, requireRole('admin'), async (req, res) => {
     try {
         const { name, roomNumber, email, phone, feeDues, monthlyFee, guardianName, emergencyContact } = req.body;
         const updated = await Student.findByIdAndUpdate(
@@ -400,9 +460,44 @@ router.post('/students/:id/payments', verifyToken, requireRole('admin', 'manager
         res.status(400).json({ message: err.message });
     }
 });
+// PUT edit a payment record (Correction) — admin only
+router.put('/students/:id/payments/:pid', verifyToken, requireRole('admin'), async (req, res) => {
+    try {
+        const student = await Student.findById(req.params.id);
+        if (!student) return res.status(404).json({ message: 'Student not found' });
 
-// DELETE a payment record — admin + manager
-router.delete('/students/:id/payments/:pid', verifyToken, requireRole('admin', 'manager'), async (req, res) => {
+        const payment = student.payments.id(req.params.pid);
+        if (!payment) return res.status(404).json({ message: 'Payment not found' });
+
+        const { amount, month, method, status, note, paidAt } = req.body;
+
+        // Adjust the overall feeDues if amount or status changed
+        if (payment.status === 'Paid') {
+            student.feeDues += payment.amount; // Revert previous paid deduction
+        }
+
+        // Apply new values
+        if (amount !== undefined) payment.amount = amount;
+        if (month !== undefined) payment.month = month;
+        if (method !== undefined) payment.method = method;
+        if (status !== undefined) payment.status = status;
+        if (note !== undefined) payment.note = note;
+        if (paidAt !== undefined) payment.paidAt = paidAt;
+
+        // Apply new paid deduction
+        if (payment.status === 'Paid') {
+            student.feeDues = Math.max(0, student.feeDues - payment.amount);
+        }
+
+        const saved = await student.save();
+        res.json(saved);
+    } catch (err) {
+        res.status(400).json({ message: err.message });
+    }
+});
+
+// DELETE a payment record — admin only
+router.delete('/students/:id/payments/:pid', verifyToken, requireRole('admin'), async (req, res) => {
     try {
         const student = await Student.findById(req.params.id);
         if (!student) return res.status(404).json({ message: 'Student not found' });

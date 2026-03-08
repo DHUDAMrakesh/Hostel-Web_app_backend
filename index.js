@@ -74,11 +74,17 @@ const apiRoutes = require('./routes/api');
 const authRoutes = require('./routes/auth');
 const studentRoutes = require('./routes/student');
 const notificationRoutes = require('./routes/notifications');
+const announcementRoutes = require('./routes/announcements');
+const financeRoutes = require('./routes/finance');
+const studentPaymentRoutes = require('./routes/studentPayment');
 
 // Auth routes FIRST (more specific), then student, then general API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/student', studentRoutes);
+app.use('/api/student/payments', studentPaymentRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/announcements', announcementRoutes);
+app.use('/api/finance', financeRoutes);
 app.use('/api', apiRoutes);
 
 app.get('/', (req, res) => {
