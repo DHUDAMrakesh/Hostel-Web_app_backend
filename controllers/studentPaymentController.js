@@ -1,169 +1,149 @@
-const Razorpay = require('razorpay');
-const crypto = require('crypto');
-const Payment = require('../models/Payment');
+const PaymentService = require('../services/PaymentService');
 const Invoice = require('../models/Invoice');
 const Student = require('../models/Student');
-const Notification = require('../models/Notification');
-const { generateReceipt } = require('../utils/pdfGenerator');
 
-// Initialize Razorpay
-const razorpay = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_12345',
-    key_secret: process.env.RAZORPAY_KEY_SECRET || 'secret_12345'
-});
+// ─── Helper to unify error responses ─────────────────────────────────────────
+const handleErr = (res, err) =>
+    res.status(err.status || 500).json({ message: err.message || 'Internal server error.' });
 
-exports.getPaymentSummary = async (req, res) => {
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/student/invoices
+// Returns Issued + Overdue invoices for the logged-in student
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getStudentInvoices = async (req, res) => {
     try {
-        const studentId = req.user.id;
-        const student = await Student.findById(studentId);
-        if (!student) return res.status(404).json({ message: 'Student not found.' });
+        const studentId = req.user._id;
+        // Find student record via userId link
+        const student = await Student.findOne({ userId: studentId });
+        if (!student) return res.status(404).json({ message: 'Student profile not found.' });
 
-        // Calculate total amounts based on invoices
-        const invoices = await Invoice.find({ studentId });
-        const totalBilled = invoices.reduce((sum, inv) => sum + inv.totalAmount, 0);
+        const invoices = await Invoice.find({
+            studentId: student._id,
+            status: { $in: ['Issued', 'Overdue', 'Pending'] }
+        }).sort({ createdAt: -1 });
 
-        // Calculate amount paid from the new Payment collection + existing manual subdocs if needed
-        const payments = await Payment.find({ studentId, paymentStatus: 'Success' });
-        const totalPaidOnline = payments.reduce((sum, p) => sum + p.amount, 0);
-
-        // Also consider legacy/manual payments inside the Student document
-        const totalPaidManual = student.payments
-            .filter(p => p.status === 'Paid')
-            .reduce((sum, p) => sum + Number(p.amount), 0);
-
-        const totalPaid = totalPaidOnline + totalPaidManual;
-
-        res.json({
-            totalFeeAmount: totalBilled || (student.monthlyFee || 0), // fallback to monthly
-            amountPaid: totalPaid,
-            pendingAmount: student.feeDues || 0,
-            dueDate: invoices.length > 0 ? invoices[invoices.length - 1].dueDate : null,
-            status: student.feeDues > 0 ? 'Pending' : 'Paid'
-        });
-    } catch (error) {
-        res.status(500).json({ message: error.message });
-    }
+        res.json(invoices);
+    } catch (err) { handleErr(res, err); }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/student/payments/create
+// Body: { invoiceId?, paymentMethod, note? }
+// If no invoiceId → advance payment using student.monthlyFee
+// ─────────────────────────────────────────────────────────────────────────────
+exports.createPayment = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const student = await Student.findOne({ userId });
+        if (!student) return res.status(404).json({ message: 'Student profile not found.' });
+
+        const { invoiceId, paymentMethod, note, amount } = req.body;
+
+        const payment = await PaymentService.createPayment(student._id, {
+            invoiceId: invoiceId || null,
+            // Advance payment: caller supplies amount, or fall back to monthlyFee
+            amount: invoiceId ? undefined : (Number(amount) || student.monthlyFee),
+            paymentMethod: paymentMethod || 'Mock',
+            note: note || (invoiceId ? '' : (() => {
+                const d = new Date();
+                const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+                return `Advance – ${months[d.getMonth()]} ${d.getFullYear()}`;
+            })())
+        });
+
+        res.status(201).json(payment);
+    } catch (err) { handleErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/student/payments/mock-success
+// Body: { paymentId }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.mockSuccess = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const student = await Student.findOne({ userId });
+        if (!student) return res.status(404).json({ message: 'Student profile not found.' });
+
+        const { paymentId } = req.body;
+        if (!paymentId) return res.status(400).json({ message: 'paymentId is required.' });
+
+        const payment = await PaymentService.mockPaymentSuccess(paymentId, student._id);
+        res.json({ message: 'Payment marked as successful.', payment });
+    } catch (err) { handleErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/student/payments/mock-failure
+// Body: { paymentId }
+// ─────────────────────────────────────────────────────────────────────────────
+exports.mockFailure = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const student = await Student.findOne({ userId });
+        if (!student) return res.status(404).json({ message: 'Student profile not found.' });
+
+        const { paymentId } = req.body;
+        if (!paymentId) return res.status(400).json({ message: 'paymentId is required.' });
+
+        const payment = await PaymentService.mockPaymentFailure(paymentId, student._id);
+        res.json({ message: 'Payment marked as failed.', payment });
+    } catch (err) { handleErr(res, err); }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/student/payments/history
+// Returns all payment records for logged-in student, newest first
+// ─────────────────────────────────────────────────────────────────────────────
 exports.getPaymentHistory = async (req, res) => {
     try {
-        const studentId = req.user.id;
-        const payments = await Payment.find({ studentId }).sort({ createdAt: -1 });
+        const userId = req.user._id;
+        const student = await Student.findOne({ userId });
+        if (!student) return res.status(404).json({ message: 'Student profile not found.' });
+
+        const payments = await PaymentService.getPaymentHistory(student._id);
         res.json(payments);
-    } catch (error) {
-        res.status(500).json({ message: error.message });
-    }
+    } catch (err) { handleErr(res, err); }
 };
 
-exports.createRazorpayOrder = async (req, res) => {
-    const { amount, invoiceId } = req.body;
-    const studentId = req.user.id;
-
-    if (!amount) return res.status(400).json({ message: 'Amount is required.' });
-
-    try {
-        const options = {
-            amount: amount * 100, // Razorpay expects amount in paise
-            currency: 'INR',
-            receipt: `rcpt_${Date.now()}`
-        };
-
-        const order = await razorpay.orders.create(options);
-
-        const newPayment = new Payment({
-            studentId,
-            invoiceId,
-            amount,
-            razorpayOrderId: order.id,
-            paymentStatus: 'Pending'
-        });
-        await newPayment.save();
-
-        res.json({
-            orderId: order.id,
-            amount: order.amount,
-            currency: order.currency,
-            keyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_12345'
-        });
-    } catch (error) {
-        console.error('Razorpay order creation error:', error);
-        res.status(500).json({ message: 'Failed to create Razorpay order.' });
-    }
-};
-
-exports.verifyPayment = async (req, res) => {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-
-    try {
-        const payment = await Payment.findOne({ razorpayOrderId: razorpay_order_id });
-        if (!payment) return res.status(404).json({ message: 'Payment record not found.' });
-        if (payment.paymentStatus === 'Success') return res.status(400).json({ message: 'Payment already verified.' });
-
-        const body = razorpay_order_id + "|" + razorpay_payment_id;
-        const expectedSignature = crypto
-            .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || 'secret_12345')
-            .update(body.toString())
-            .digest('hex');
-
-        if (expectedSignature === razorpay_signature) {
-            payment.paymentStatus = 'Success';
-            payment.razorpayPaymentId = razorpay_payment_id;
-            payment.razorpaySignature = razorpay_signature;
-            await payment.save();
-
-            // 1. Update Student Dues
-            const student = await Student.findById(payment.studentId);
-            if (student) {
-                student.feeDues = Math.max(0, (student.feeDues || 0) - payment.amount);
-                await student.save();
-            }
-
-            // 2. Update Invoice to Paid if applicable
-            if (payment.invoiceId) {
-                const invoice = await Invoice.findById(payment.invoiceId);
-                if (invoice) {
-                    invoice.status = 'Paid';
-                    await invoice.save();
-                }
-            }
-
-            // 3. Send Notification to Student
-            const notification = new Notification({
-                recipient: student._id,
-                recipientModel: 'Student',
-                title: 'Payment Successful',
-                message: `Your payment of ₹${payment.amount} was successful. Transaction ID: ${razorpay_payment_id}`,
-                type: 'payment',
-                relatedId: payment._id,
-                onModel: 'Payment'
-            });
-            await notification.save();
-
-            res.json({ message: 'Payment verified successfully.' });
-        } else {
-            payment.paymentStatus = 'Failed';
-            await payment.save();
-            res.status(400).json({ message: 'Invalid payment signature.' });
-        }
-    } catch (error) {
-        console.error('Verification Error:', error);
-        res.status(500).json({ message: 'Internal Server Error' });
-    }
-};
-
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/student/payments/receipt/:paymentId
+// Streams a PDF receipt for a successful payment
+// ─────────────────────────────────────────────────────────────────────────────
 exports.downloadReceipt = async (req, res) => {
     try {
-        const paymentId = req.params.paymentId;
-        const studentId = req.user.id;
+        const userId = req.user._id;
+        const student = await Student.findOne({ userId });
+        if (!student) return res.status(404).json({ message: 'Student profile not found.' });
 
-        const payment = await Payment.findOne({ _id: paymentId, studentId, paymentStatus: 'Success' });
-        if (!payment) return res.status(404).json({ message: 'Valid payment not found.' });
+        await PaymentService.generateReceipt(req.params.paymentId, student._id, res);
+    } catch (err) { handleErr(res, err); }
+};
 
-        const student = await Student.findById(studentId);
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/student/payments/summary
+// Returns fee overview for the logged-in student (used by dashboard)
+// ─────────────────────────────────────────────────────────────────────────────
+exports.getPaymentSummary = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const student = await Student.findOne({ userId });
+        if (!student) return res.status(404).json({ message: 'Student profile not found.' });
 
-        generateReceipt(payment, student, res);
-    } catch (error) {
-        console.error('Download Receipt Error:', error);
-        res.status(500).json({ message: 'Failed to generate receipt.' });
-    }
+        const invoices = await Invoice.find({ studentId: student._id });
+        const totalBilled = invoices.reduce((s, inv) => s + inv.totalAmount, 0);
+
+        const payments = await PaymentService.getPaymentHistory(student._id);
+        const totalPaid = payments
+            .filter(p => p.paymentStatus === 'Success')
+            .reduce((s, p) => s + p.amount, 0);
+
+        res.json({
+            totalFeeAmount: totalBilled || student.monthlyFee || 0,
+            amountPaid: totalPaid,
+            pendingAmount: student.feeDues || 0,
+            monthlyFee: student.monthlyFee || 0,
+            status: student.feeDues > 0 ? 'Pending' : 'Paid'
+        });
+    } catch (err) { handleErr(res, err); }
 };

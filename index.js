@@ -69,7 +69,6 @@ mongoose.connect(MONGO_URI)
     })
     .catch(err => console.log('MongoDB connection error:', err));
 
-// Import Routes
 const apiRoutes = require('./routes/api');
 const authRoutes = require('./routes/auth');
 const studentRoutes = require('./routes/student');
@@ -77,11 +76,25 @@ const notificationRoutes = require('./routes/notifications');
 const announcementRoutes = require('./routes/announcements');
 const financeRoutes = require('./routes/finance');
 const studentPaymentRoutes = require('./routes/studentPayment');
+const managerPaymentRoutes = require('./routes/managerPayment');
+const adminPaymentRoutes = require('./routes/adminPayment');
 
 // Auth routes FIRST (more specific), then student, then general API routes
+app.get('/api/health', (req, res) => {
+    console.log('--- Health check HIT ---');
+    res.json({
+        status: 'healthy',
+        server: 'online',
+        database: mongoose.connection.readyState === 1 ? 'connected' : 'offline',
+        timestamp: new Date().toISOString()
+    });
+});
+
 app.use('/api/auth', authRoutes);
 app.use('/api/student', studentRoutes);
-app.use('/api/student/payments', studentPaymentRoutes);
+app.use('/api/student', studentPaymentRoutes);
+app.use('/api/manager/payments', managerPaymentRoutes);
+app.use('/api/admin', adminPaymentRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/announcements', announcementRoutes);
 app.use('/api/finance', financeRoutes);
