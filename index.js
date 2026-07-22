@@ -26,9 +26,9 @@ if (!process.env.TWILIO_AUTH_TOKEN) process.env.TWILIO_AUTH_TOKEN = '';
 if (!process.env.TWILIO_WHATSAPP_FROM) process.env.TWILIO_WHATSAPP_FROM = 'whatsapp:+14155238886';
 
 
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+// Ensure uploads directory exists (Skip on Vercel due to read-only filesystem)
+const uploadsDir = process.env.VERCEL ? '/tmp/uploads' : path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
 // Middleware
 app.use(compression()); // gzip all responses
@@ -45,12 +45,16 @@ const limiter = rateLimit({
 });
 app.use('/api', limiter);
 
-// Non-blocking request logging
-const logStream = fs.createWriteStream(path.join(__dirname, 'requests.log'), { flags: 'a' });
+// Non-blocking request logging (Skip on Vercel)
+let logStream = null;
+if (!process.env.VERCEL) {
+    logStream = fs.createWriteStream(path.join(__dirname, 'requests.log'), { flags: 'a' });
+}
+
 app.use((req, res, next) => {
     const log = `${new Date().toISOString()} - ${req.method} ${req.url}\n`;
     process.stdout.write(log);
-    logStream.write(log);  // async, non-blocking
+    if (logStream) logStream.write(log);  // async, non-blocking
     next();
 });
 
