@@ -14,12 +14,12 @@ console.log('Config skipped (manual override)');
 const app = express();
 console.log('App created');
 const PORT = 5001;
-process.env.PORT = 5001;
-process.env.JWT_SECRET = 'hostel_rbac_super_secret_key_2026';
-process.env.JWT_EXPIRES_IN = '7d';
-process.env.EMAIL_USER = 'dhudamrakesh0@gmail.com';
-process.env.EMAIL_PASS = 'bycnejhbblrecwjr';
-process.env.MONGO_URI = 'mongodb://localhost:27017/hostel_db';
+process.env.PORT = process.env.PORT || 5001;
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'hostel_rbac_super_secret_key_2026';
+process.env.JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+process.env.EMAIL_USER = process.env.EMAIL_USER || 'dhudamrakesh0@gmail.com';
+process.env.EMAIL_PASS = process.env.EMAIL_PASS || 'bycnejhbblrecwjr';
+process.env.MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/hostel_db';
 // Twilio WhatsApp — set these in .env for production
 if (!process.env.TWILIO_ACCOUNT_SID) process.env.TWILIO_ACCOUNT_SID = '';
 if (!process.env.TWILIO_AUTH_TOKEN) process.env.TWILIO_AUTH_TOKEN = '';
@@ -104,6 +104,10 @@ app.get('/', (req, res) => {
     res.send('Hostel Management API is running');
 });
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+if (!process.env.VERCEL) {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
+}
+
+module.exports = app;
